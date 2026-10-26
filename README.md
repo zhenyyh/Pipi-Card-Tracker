@@ -1,12 +1,22 @@
 # Pipi Card Tracker
 
+[![test](https://github.com/zhenyyh/Pipi-Card-Tracker/actions/workflows/test.yml/badge.svg)](https://github.com/zhenyyh/Pipi-Card-Tracker/actions/workflows/test.yml)
+
 皮皮跑胡子（`com.happyplay.hnphz`）的牌局采集与还原。**不猜字段**——
-每一个口径都能在客户端自己的字节码或随包规则文本里找到出处，
+每一个口径都能在客户端自己的字节码或官方规则文本里找到出处，
 出处和推导过程都在 [`docs/FINDINGS.md`](docs/FINDINGS.md)。
 
 上一代工程（`phz-hook-emu`）能跑，但有一堆「大概是这么回事」的地方，
 踩了三个大坑才勉强对上：总牌守恒差 3 张、明牌胡息对不上 `origWinNum`、
 「将」归不了类。这个工程把这些点全部回到证据上重做了一遍。
+
+**依赖**：Python 3.9+，**零第三方包**（只用标准库）。
+离线还原不需要设备，也不需要游戏。
+
+```bash
+python -m pct replay tests/fixtures/round_v3.jsonl   # 立刻看一局
+python tests/test_rules.py                           # 回归 23 项
+```
 
 ---
 
