@@ -13,8 +13,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # ubuntu-22.04 而不是 latest：24.04 上 setup-python 取不到 3.9 的预编译包
+        os: [ubuntu-22.04, windows-latest]
         python: ["3.9", "3.13"]
+
+    env:
+      # 双保险：包内的 _force_utf8_stdio() 已经 reconfigure 过，
+      # 这里再钉一次环境变量，避免别人 fork 后删掉那段就炸。
+      # （windows-latest 的控制台是 cp1252，中文和 ✓ 会 UnicodeEncodeError）
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
 
     steps:
       - uses: actions/checkout@v4
