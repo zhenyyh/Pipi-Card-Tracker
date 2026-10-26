@@ -1,0 +1,36 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  regression:
+    name: 回归（${{ matrix.python }} / ${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.9", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # 回归脚本零第三方依赖：只用标准库 + 自带的 test_rules.py
+      - name: 跑回归
+        run: python tests/test_rules.py
+
+      - name: 离线还原四局（冒烟，确认 CLI 能跑通）
+        run: |
+          python -m pct replay tests/fixtures/round_v3.jsonl
+          python -m pct replay tests/fixtures/round_kan.jsonl
+          python -m pct replay tests/fixtures/round_multi4.jsonl --round 4
+          python -m pct replay tests/fixtures/round_draw.jsonl
+        shell: bash

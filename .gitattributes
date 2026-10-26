@@ -1,0 +1,16 @@
+# 统一用 LF 入库 —— 这些脚本要跑在 Linux/Android 上，
+# CRLF 会让 shell / awk 脚本直接挂（上一代工程踩过）。
+* text=auto eol=lf
+
+*.py    text
+*.js    text
+*.md    text
+*.json  text
+*.jsonl text
+*.txt   text
+*.yml   text
+
+# 二进制
+*.png   binary
+*.jpg   binary
+*.so    binary
