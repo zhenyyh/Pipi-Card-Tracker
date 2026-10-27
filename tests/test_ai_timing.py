@@ -25,18 +25,32 @@ class TimingTests(unittest.TestCase):
     def test_important_changes_invalidate_fingerprint(self):
         original = decision_fingerprint(self.state)
         self.assertTrue(original)
+        # 真正影响「该打哪张」的字段：变了就必须重算
         for key, value in [("tableid", "other"), ("playNum", 2),
-                           ("tState", 5), ("curPlayer", 1), ("cardNext", 42),
-                           ("lastPut", 3), ("playType", 123)]:
+                           ("tState", 5), ("curPlayer", 1),
+                           ("lastPut", 3)]:
             changed = copy.deepcopy(self.state)
             changed[key] = value
             self.assertNotEqual(original, decision_fingerprint(changed), key)
         changed = copy.deepcopy(self.state)
         changed["seats"][0]["hand"] = [1, 2]
         self.assertNotEqual(original, decision_fingerprint(changed))
+
+    def test_volatile_fields_do_not_invalidate_fingerprint(self):
+        """cardNext/ev/playType 高频抖动，不能用来作废结果。
+
+        历史 bug：fingerprint 含 lastEvent（事件 seq）和 cardNext，导致每次新事件
+        fingerprint 就变 → 结果永远「过期」→ 无限请求-丢弃循环（实测 3 分钟 100+ 次）。
+        这些变化已被 hand 覆盖：自己摸牌 hand 必变；对手摸牌本就不该重算我的出牌。
+        """
+        original = decision_fingerprint(self.state)
+        for key, value in [("cardNext", 42), ("playType", 123), ("lastPutPlayer", 1)]:
+            changed = copy.deepcopy(self.state)
+            changed[key] = value
+            self.assertEqual(original, decision_fingerprint(changed), key)
         changed = copy.deepcopy(self.state)
         changed["ev"].append({"q": 9})
-        self.assertNotEqual(original, decision_fingerprint(changed))
+        self.assertEqual(original, decision_fingerprint(changed))
         self.assertEqual("", decision_fingerprint(None))
         self.assertEqual("", decision_fingerprint({"tableid": "room", "err": "bad"}))
 
