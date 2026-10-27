@@ -10,8 +10,8 @@
 踩了三个大坑才勉强对上：总牌守恒差 3 张、明牌胡息对不上 `origWinNum`、
 「将」归不了类。这个工程把这些点全部回到证据上重做了一遍。
 
-**依赖**：Python 3.9+，**零第三方包**（只用标准库）。
-离线还原不需要设备，也不需要游戏。
+**依赖**：Python 3.9+。离线还原只用标准库，不需要设备或游戏；
+设备悬浮窗还需要与设备端 frida-server 版本匹配的 Python `frida` 包。
 
 ```bash
 python -m pct replay tests/fixtures/round_v3.jsonl   # 立刻看一局
@@ -79,6 +79,23 @@ python tests/test_rules.py
 设备参数在 `pct/bridge.py` 的 `DEFAULTS` 里：adb 路径、`127.0.0.1:5555`、
 包名、以及原生 agent 的驱动脚本（外部工程 `phz-hook-emu/ldmon.py`，
 Zygisk provider + houdini 翻译层，不在这里重写）。
+
+### AI 出牌建议
+
+守护程序优先从环境变量 `DEEPSEEK_API_KEY` 读取 DeepSeek 密钥，也可读取
+本机的 `.pct/deepseek_key` 文件。该文件不纳入 Git，可以继续使用已有密钥。
+首次使用悬浮窗时安装与设备端匹配的 Frida（本设备为 16.7.19），
+然后在启动守护程序的 PowerShell 窗口中设置：
+
+```powershell
+python -m pip install frida==16.7.19
+$env:DEEPSEEK_API_KEY = "你的 DeepSeek API 密钥"
+python -m pct.overlay
+```
+
+未配置密钥时记牌器仍可使用，AI 面板会提示配置。AI 只提供简短的出牌建议；
+由于目前无法可靠确认响应者及可用操作，吃、碰、胡等响应阶段暂不提供建议。
+牌局变化时旧建议会作废。密钥保留在本机配置文件或环境变量中。
 
 ### 还原出来长什么样
 

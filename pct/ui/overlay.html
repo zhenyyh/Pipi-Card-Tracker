@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>记牌器</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    background: transparent;
+    width: 300px;
+    font-family: "PingFang SC", "Noto Sans CJK SC", "Source Han Sans SC", sans-serif;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+
+  /* ---------------------------------------------------------------- 卡片 */
+  .card {
+    width: 300px;
+    background: rgba(14, 22, 17, 0.62);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 18px;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.35);
+    overflow: hidden;
+  }
+
+  /* ---------------------------------------------------------------- 标题 */
+  .head {
+    display: flex;
+    align-items: center;
+    height: 46px;
+    padding: 0 14px;
+    cursor: move;
+  }
+  .head .lbl {
+    color: rgba(255, 255, 255, 0.62);
+    font-size: 13px;
+    letter-spacing: 0.5px;
+  }
+  .head .mini {
+    display: inline-block;
+    min-width: 26px;
+    height: 30px;
+    line-height: 30px;
+    margin: 0 2px;
+    padding: 0 5px;
+    text-align: center;
+    font-size: 17px;
+    font-weight: 700;
+    color: #1A1A1A;
+    background: #FAF7EC;
+    border-radius: 4px;
+    box-shadow: inset 0 -3px 0 #CBD9B6;
+  }
+  .head .mini.red { color: #C8102E; }
+  .head .mini.none {
+    color: rgba(255, 255, 255, 0.28);
+    background: rgba(255, 255, 255, 0.07);
+    box-shadow: none;
+    font-weight: 400;
+  }
+  .head .sep {
+    color: rgba(255, 255, 255, 0.16);
+    margin: 0 10px;
+  }
+  .head .spacer { flex: 1; }
+  .head .chev {
+    color: rgba(255, 255, 255, 0.55);
+    font-size: 13px;
+    transition: transform 0.18s ease;
+    padding: 6px 2px 6px 10px;
+  }
+  .collapsed .head .chev { transform: rotate(180deg); }
+
+  /* ---------------------------------------------------------------- 列表 */
+  .body {
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 10px 14px 12px;
+  }
+  .collapsed .body { display: none; }
+  .collapsed .head { height: 46px; }
+
+  .row {
+    display: flex;
+    align-items: center;
+    padding: 5px 0;
+  }
+  .row + .row { border-top: 1px dashed rgba(255, 255, 255, 0.055); }
+
+  .grp { display: flex; gap: 5px; }
+  .arrow {
+    color: rgba(255, 255, 255, 0.30);
+    font-size: 15px;
+    margin: 0 9px;
+    flex: 1;
+    text-align: center;
+  }
+
+  /* ---------------------------------------------------------------- 牌 */
+  .pai {
+    position: relative;
+    width: 40px;
+    height: 52px;
+    background: #FAF7EC;
+    border: 1px solid #E2DCC8;
+    border-radius: 5px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 23px;
+    font-weight: 700;
+    color: #191919;
+    box-shadow: inset 0 -5px 0 #CBD9B6, 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+  .pai.red { color: #C8102E; }
+
+  /* 盖牌（偎的两张暗牌）：蓝色菱形纹理 */
+  .pai.back {
+    background:
+      repeating-linear-gradient(45deg, rgba(255,255,255,0.16) 0 2px, transparent 2px 7px),
+      repeating-linear-gradient(-45deg, rgba(255,255,255,0.16) 0 2px, transparent 2px 7px),
+      #2F4C7E;
+    border-color: #FFFFFF;
+    box-shadow: inset 0 -5px 0 #24395E, 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+
+  /* 提/跑的第四张：稍微压暗，读作「同一组」 */
+  .pai.quad { box-shadow: inset 0 -5px 0 #A9BD8E, 0 1px 2px rgba(0,0,0,.4); }
+
+  .empty {
+    color: rgba(255, 255, 255, 0.30);
+    font-size: 12px;
+    text-align: center;
+    padding: 16px 0 18px;
+    line-height: 1.7;
+  }
+
+  /* ---------------------------------------------------------------- 底部统计 */
+  .foot {
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding: 8px 14px 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 9px;
+  }
+  .collapsed .foot { display: none; }
+  .stat {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.40);
+    font-variant-numeric: tabular-nums;
+  }
+  .stat b {
+    color: rgba(255, 255, 255, 0.78);
+    font-weight: 600;
+  }
+  .stat.zero b { color: #FF6B5B; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div class="head" id="head">
+    <span class="lbl">底牌：</span><span class="mini none" id="bottom">—</span>
+    <span class="sep">|</span>
+    <span class="lbl">首出：</span><span class="mini none" id="first">—</span>
+    <span class="spacer"></span>
+    <span class="chev" id="chev">▲</span>
+  </div>
+  <div class="body" id="body">
+    <div class="empty" id="empty">等待开局…</div>
+  </div>
+</div>
+
+<script>
+// 牌值映射：1..10 小写 / 101..110 大写。六 → 六，106 → 陸（游戏内写法）
+var NUM_S = ['', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+var NUM_B = ['', '壹', '贰', '叁', '肆', '伍', '陸', '柒', '捌', '玖', '拾'];
+var RED = { 2: 1, 7: 1, 10: 1, 102: 1, 107: 1, 110: 1 };
+
+function cardText(v) {
+  if (!v || v < 1) return '';
+  if (v > 100) return NUM_B[v - 100] || '?';
+  return NUM_S[v] || '?';
+}
+function isRed(v) { return !!RED[v]; }
+
+function paiHtml(v, cls) {
+  if (v === 0 || v === null || v === undefined) {
+    return '<div class="pai back' + (cls ? ' ' + cls : '') + '"></div>';
+  }
+  return '<div class="pai' + (isRed(v) ? ' red' : '') + (cls ? ' ' + cls : '') + '">' +
+         cardText(v) + '</div>';
+}
+
+// 一行的左边：门子牌组。kind 决定盖几张
+//   peng 碰 3 亮 / wei 偎 1 亮 + 2 盖 / ti 提 4 亮 / pao 跑 4 亮（1 张来自别人）
+//   chi 吃 3 亮 / lie 摆火 1 亮
+function meldHtml(row) {
+  var cards = row.cards || [];
+  switch (row.kind) {
+    case 'wei':
+      var out = paiHtml(cards[0]);
+      for (var i = 1; i < 3; i++) out += paiHtml(0);
+      return out;
+    case 'ti':
+    case 'pao':
+      var s = '';
+      for (var j = 0; j < cards.length; j++) s += paiHtml(cards[j], j === 3 ? 'quad' : '');
+      return s;
+    default:
+      var t = '';
+      for (var k = 0; k < cards.length; k++) t += paiHtml(cards[k]);
+      return t;
+  }
+}
+
+var state = null;
+
+function render(st) {
+  state = st || {};
+  var bottom = document.getElementById('bottom');
+  var first = document.getElementById('first');
+  var body = document.getElementById('body');
+
+  bottom.className = 'mini' + (state.bottom ? (isRed(state.bottom) ? ' red' : '') : ' none');
+  bottom.textContent = state.bottom ? cardText(state.bottom) : '—';
+
+  first.className = 'mini' + (state.first ? (isRed(state.first) ? ' red' : '') : ' none');
+  first.textContent = state.first ? cardText(state.first) : '—';
+
+  var rows = state.rows || [];
+  if (!rows.length) {
+    var msg = state.ended ? '本局已结束' : (state.inGame ? '对方还没有成门子' : '等待开局…');
+    body.innerHTML = '<div class="empty">' + msg + '</div>';
+  } else {
+    var html = '';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      html += '<div class="row"><div class="grp">' + meldHtml(r) + '</div>' +
+              '<div class="arrow">→</div><div class="grp">' +
+              (r.after ? paiHtml(r.after) : '<div class="pai" style="background:transparent;border:1px dashed rgba(255,255,255,.18);box-shadow:none"></div>') +
+              '</div></div>';
+    }
+    body.innerHTML = html;
+  }
+  notifySize();
+}
+
+// 把内容高度告诉原生，让它调整悬浮窗大小
+function notifySize() {
+  var h = document.getElementById('card').getBoundingClientRect().height;
+  var px = Math.ceil(h * (window.devicePixelRatio || 1)) + 2;
+  location.href = 'pct://resize?h=' + px;
+}
+
+var collapsed = false;
+window.toggleCollapse = function () {
+  collapsed = !collapsed;
+  document.getElementById('card').classList.toggle('collapsed', collapsed);
+  setTimeout(notifySize, 30);
+};
+// 原生触摸层负责「拖动 vs 点击」的区分，点击时回调这个；留 click 兜底
+document.getElementById('head').addEventListener('click', function () { window.toggleCollapse(); });
+
+// 拖动：按住标题栏移动窗口（原生侧处理，这里只做视觉反馈）
+document.addEventListener('DOMContentLoaded', function () { notifySize(); });
+
+render({ inGame: false });
+</script>
+</body>
+</html>
