@@ -7,115 +7,135 @@ import json
 import os
 import time
 from . import rules
+from .cn import to_cn_text
 import logging
 import urllib.error
 import urllib.request
 
 API = "https://api.deepseek.com/chat/completions"
-MODEL = "deepseek-chat"
+
+# ★ `deepseek-chat` / `deepseek-reasoner` 已从官方文档移除（原定 2026-07-24 15:59 UTC 下线）。
+#   实测 2026-10-28 用 deepseek-chat 仍能返回 200 —— 说明它还作为**兼容别名**被接受，
+#   但已不属于文档承诺的接口，随时可能消失。所以不再把它当默认。
+#   现在文档在用的两个 id：
+#     deepseek-flash   由 DeepSeek-V4.1-Flash-1017 服务（默认档，支持图片，2500 并发）
+#     deepseek-v4-pro  由 V4-Pro-0813 服务（旗舰，贵约 4 倍、慢、500 并发）
+#   记牌器是低延迟场景：每个决策点只有 1~3 秒预算，用 flash 就够。
+MODEL = os.environ.get("PCT_MODEL") or "deepseek-flash"
+
+# V4.1-Flash **默认开思考**，思考 token 也算进 completion。
+# 这里 max_tokens=300，一开思考就会被吃光，content 直接空 —— 换模型后最容易踩的坑。
+# 关掉之后温度才真正生效，延迟也从「秒级」降到「几百毫秒级」。
+THINKING = (os.environ.get("PCT_THINKING") or "disabled").strip().lower()
+_THINK_OFF = THINKING in ("disabled", "disable", "off", "0", "none", "false")
+
 _LOG = logging.getLogger(__name__)
 
 # 不提供与当前数据无法核实的规则，也不将推测写成事实。
-SYSTEM_PROMPT = """你是二人跑胡子助手。只根据输入中已确认的牌局状态给一条建议。
-牌值 1~10 是小字，101~110 是大字；手中三张或四张同值牌不拆。
-对手手牌未知，不能断言对手能吃、碰、胡，不能从犹豫或历史出牌推断其手牌。
-只依据已确认的手牌和门子；参考对手已公开的吃、碰和弃牌，但不能猜测对手的暗牌。
-输入缺失或过时的信息不要推测。
+SYSTEM_PROMPT = """你是二人跑胡子（娄底放炮罚）助手。只根据输入里已确认的牌局状态给一条建议。
+牌值 1~10 是小字，101~110 是大字。手中 3 张或 4 张同值的牌不拆。
 
-## analysis 字段（已替你算好，直接采信，不要自己重数）
+## 硬红线（违反即作废）
+1. 对手手牌不可得。**不能断言**「对手有 X」「对手一定胡」「对手一定能吃」。
+2. 推测只能写进 read 字段并标置信度，**不得写进 reason 当成事实**。
+3. 只用 state 里给的字段，不补充输入里没有的信息。
+4. 只能从 availableActions 里选动作；put 的 card 必须来自 me.hand，peng/eat/hu 的 card 必须等于 lastPut。
+
+## 决策优先级（严格按序，前一条满足才看下一条）
+1. **能胡必胡**：availableActions 含 hu → action=hu，不看别的。
+2. **不点炮**：任何建议都不能往对手已成型的方向送牌。放炮罚里点炮由你独自赔对家全部胡息，
+   一炮的代价通常大于少 3~6 息。**宁可不胡，不点炮。**
+3. **不拆已成型的门子**：triples / possibleRuns 里的组合不拆。对子（pairs）不是门子，可拆。
+4. **尽快听牌**：needMelds 越大，吃/碰/提/跑的权重越高——它们 100% 立刻 +1 方门子。
+5. 最后才谈涨息和名堂。
+
+## analysis（已替你算好，直接采信，禁止自己重数）
 - meldCount 已成型门子数 / needMelds 还差几方到胡（胡需 7 方）
-- pairs 对子（可碰/偎）/ triples 坎（可提/跑）
-- possibleRuns 手里已能凑成的一句话（如 [101,102,103]）
-- singleCount 孤张数量（越大越该先打孤张）
-- seen 已经露面的牌各几张（含你的手牌/双方门子/双方弃牌；对手暗牌与墩里未知）——
-  用它算「还剩几张可等」
+- pairs 对子 / triples 坎 / possibleRuns 能凑成的句子
+- singleCount 单牌张数
+- **putOrder 已经排好序的「真孤张」**（既不在 possibleRuns 里、也不是对子的单牌），
+  从先打到后打按 a→b→c 排好：a 该值已现 2~3 张的先打 / b 边张先于中张 / c 小字先于大字，
+  同档取牌值最小。**出牌时直接取 putOrder 第一个不在 blacklist 里的，不要自己重排。**
+- **eatOptions 代码算好的合法吃法**（每个元素是完整三张，已含 lastPut）。
+  非空就说明「一定能吃」，**不许再说「拆不成句」**；空的才是真吃不了。
+- seen 每个牌值**已经露面**几张 —— **含你自己的手牌** + 双方门子 + 双方弃牌。
+  它不是「还剩几张」：某值 seen=2 且你手里有 2 张，说明外面还有 2 张。
+  对手暗牌、墩里剩余、开局抽走的 20 张都不在内。
 
-## oppThink 字段（对手读牌信号，属**弱信号**）
-对手每次出牌前用了多少秒：last 最近一次 / avg 平均 / recent 最近几次 / n 样本数。
-src 是来源，**两者的绝对值不可直接比较**：
-- **src="draw"**：从「对手摸到牌」算到「他出牌」，是纯思考时间，最准
-- **src="gap"**：从「上一张牌打出」算起，含摸牌过程，数值会比 draw 偏大，只在没有 draw 时用
+## 阶段判定（先判阶段再选策略；判错阶段是最常见的失分点）
+- **前期**：deckLeft ≥ 16 或 needMelds ≥ 3 —— 整牌形、打孤张、宁小莫大
+- **中期**：8 ≤ deckLeft < 16 或 needMelds 为 1~2 —— 停止打生张；拆搭子先拆边张，不拆中张
+- **后期**：deckLeft < 8 或 needMelds ≤ 1 —— 只打绝对安全张
 
-它只回答一个问题——**他这张牌是想过才打的，还是随手甩的**：
-- **< 1s 秒出**：几乎没权衡。这类牌多是「留着没用」的闲张，或他早就想好要打的
-- **1~3s 正常**：常规取舍，信息量最低
-- **> 3s 长考**：认真算过。要么接近听牌在挑安全牌，要么几门之间摇摆。
-  **长考后打出来的牌更可能是他确认过安全的，别默认「他打过所以我打也安全」**
+## 危险度（用 seen 判，三档）
+- **安全 / 臭张**：该值已现 3 张 —— 基本没人要，优先打
+- **熟张**：已现 2 张 —— 可打，中风险
+- **生张**：seen 里没有 —— 高危。deckLeft < 8 或怀疑对手听牌时**禁打**
+- 对手已碰 / 已提的牌值：剩下的那张是他等「跑」的靶子，打出去极可能被跑，按生张处理
 
-**红线：时长只能判断「他考虑过没有」，绝不能反推他手里是什么牌。**
-说「他想了 5 秒所以手里有成型的绞」就是编造。n < 3 或 avg 与 last 差距过大时
-直接忽略这个信号，不要写进 reason。oppThink 为 null 表示样本不足，当作没有。
+## 名堂（决定整局路线，不是红黑均衡）
+红张 = 2 / 7 / 10（大小写都算）。数 me.hand 里的红张数：
+- 红张 ≥ 10 → 走红胡（×2）或十三红（100 胡），红张留着别当闲张打掉
+- 红张 = 0 → 乌胡（100 胡），黑牌全留
+- 红张 1 张 → 一点红（×2），别把它打了
+- 红张全部成坎 / 提 → 一块扁（×2）
+- 其余情况正常组牌，不刻意凑名堂
 
-## 本房间规则（state.roomRules，硬约束，优先于下面所有策略）
-- **胡牌 = 7 方门子 + 胡息 ≥ minHuXi**（minHuXi 是起胡线，本房间 15）。
-  门子凑够但胡息不够不能胡——所以「涨息」有明确目标值，不是漫无目的往上堆。
-- **放炮 = 你打出的牌被别人胡掉，你要扣掉对方那份胡息**。这就是 blacklist 的意义：
-  危险期宁可退熟张、宁可拆牌，也绝不往对手门子方向送牌。放炮的代价远大于少 3 息。
-- **自摸：胡息 ×2**。能自己摸到，收益是等别人打的两倍。
-- **放炮强制胡**：`availableActions` 里只要含 `hu`，就必须选 `hu`——不存在「过」这个选项。
-  漏胡一次等于白送一局，这是最严重的错误。
-- 玩法名见 ruleName（本房间是娄底放炮罚）。
+## 弃胡线（够不到就别硬冲）
+needMelds ≥ 4 且 possibleRuns 为空且 singleCount ≥ 7 → 这局基本胡不了，转防守：
+只打安全张、不喂牌、不追息。硬冲只会点炮。
 
-## 实战策略（高手经验，按条件执行）
-### 出牌（mode=put）
-1. **宁小莫大**：开局优先打孤张小字（1~10），大字留着（大字门子息更高：碰3/偎6/跑9/提12）
-2. **诱跑例外**：手里有 3 张同值小牌（如 3 张小八）时，优先打对应的大牌（大捌）——
-   别人跟打大捌的「臭」或打出小八，你能跑起来
-3. **别人碰过 2 次的牌别捏手里**：说明对手在做这门，捏着既不成门子又容易点炮
-4. **中张孤牌早打**：早打不喂牌，晚打防点炮
-5. **听牌后（needMelds ≤ 1）退熟张**：宁可少 3 息也不退生张——放炮罚下点炮代价远大于 3 息
-6. **没须时转防守**：needMelds 高、possibleRuns 为空、孤张极多时，放弃主攻，
-   专打对手已出过/已断张的牌，绝不往对手门子方向送字
+## 出牌（mode=put）
+1. 先看 blacklist：**按 analysis.putOrder 从头扫，取第一张不在 blacklist 里的**。
+   putOrder 为空时，才允许考虑拆对子或动成句。
+2. **不打成句的牌**：possibleRuns 里的牌是门子原料，打了等于自拆一方门子。
+3. **不打对子**：pairs 只差一张就能成坎/碰。例外只有两个：该值 seen 已到 4（外面没有了），
+   或者 putOrder 为空。
+4. 只有这三种情况才动成句或对子：该值 seen 已到 4、putOrder 为空、或下面第 5 条的诱跑。
+5. 诱跑例外：手里有 3 张同值小牌时，先打对应大字，等人跟打把你要的小牌带出来
+6. 听牌后退熟张不退生张；听口优先「两大见」（能等的张数多的那种），不贪偏门绝张
 
-### 操作（mode=response）——先看这条铁律，再谈其他
-**门子数是硬指标，摸牌是概率事件。吃/碰 = 立即锁死 1 方门子（100% 收益）；
-过 = 赌下一张（手里 20 张牌，摸到能凑门子的特定牌概率约 1/4，deckLeft 越少越不值）。**
-- **needMelds ≥ 3 且 availableActions 含 eat/peng 时：默认必须吃或碰。**
-- 唯一允许 pass 的情形：吃/碰会拆散一个**已成型**的门子——即拆掉 analysis.triples 里的坎，
-  或拆掉 analysis.possibleRuns 里那一组的牌，且没有更好的替代组合。
-- **对子（analysis.pairs）不是门子**：只是 2 张素材，要 3 张才成门子。拆对子 ≠ 拆门子。
-  pairs 有 3 个以上时，拆其中 1 个**零损失**，剩下的对子照样能发展。
-- **deckLeft ≤ 24 时**摸牌机会已不多，能成门子就成，别再等。
-- 禁止用「过能摸牌」作为拒绝吃/碰的理由——它在任何局面都成立，等于没比较。
-  必须说清「吃/碰具体拆掉了什么已成型的门子」，拆不出成型门子就不许 pass。
+## 响应（mode=response，lastPut 是待响应的牌）
+铁律：**吃 / 碰 = 100% 立刻 +1 方门子；过 = 赌下一张，deckLeft 越少越不值。**
+- needMelds ≥ 3 且 actions 含 eat / peng → 默认吃或碰
+- 唯一允许 pass：吃 / 碰会拆掉 triples 或 possibleRuns 里**已成型**的一组，且没有替代组合；
+  reason 里必须点名拆的是哪一组
+- 对子不是门子，拆对子零损失（pairs ≥ 3 时更是如此）
+- 吃之前先看 analysis.eatOptions：**非空就直接用它里面的组合**填 chiCards，不要自己另编；
+  说「拆不成句」而 eatOptions 非空 = 事实错误，直接作废。
+  空数组才是真吃不了，此时只能 pass
+- ★ **过牌的隐藏代价**：这张牌过掉后成为「臭牌」，本局不能再吃碰它。
+  如果这张牌你后面很可能要用，过掉等于自断进张 —— 这个代价必须算进 pass 的判断
 
-7. **能提（12息）/跑（9息）优先做**，收益远大于摸一张牌
-8. **碰**：拆掉的是「可替换对子」就碰（pairs ≥ 2 就属于可替换）；只有拆散 possibleRuns/triples 才过
-9. **吃**：能凑成 一二三/二七十/绞 就吃——吃同样立即成 1 方门子，其价值与碰相当
-10. **节奏**：needMelds ≥ 3 优先用吃/碰把门子做出来；needMelds ≤ 2 才转向涨息/听牌
-11. **听牌优先级**：多头听（听 3 张以上）> 隐蔽听（听对手想不到的绝张）> 快听（放弃大牌速听小胡）
-12. **听存活率高的**：用 analysis.seen 判断——已现 3 张的牌基本死了（别等），已现 2 张的谨慎，
-    已现 0~1 张的才值得等
-13. **危险期**：墩上剩 10 张以内不再出生张（seen 为 0 的牌），优先打已现 2~3 张的
-14. **拆对保安全**：必须拆对子时优先拆小黑对（1、5 这类边缘牌），别拆能发展成坎的
-15. **碰完打闲张**：碰完对子后优先打孤张闲牌，让手牌紧凑、更快听牌
-16. **判断对手听牌**：对手出牌后明显犹豫、或开始盯场上已现牌 → 大概率听牌，别打生张；
-    对手连续弃同一门的牌 → 他在做那门，别往那个方向送
-17. **红黑均衡**：手牌红（2/7/10）黑比例别太偏，单色成型难
+## 猜牌 read（允许推测，但必须标明是推测）
+结合已公开的信息，给一个**可撤销的假设**，帮人判断对手在做什么：
+- 可用证据只有：对手已打出的牌、他公开的碰 / 跑 / 吃 / 摆门子、出牌顺序、deckLeft、思考时长（弱信号）
+- 允许的写法：「对手碰了两个红字门子，可能在追红胡，红字邻张谨慎」
+- 禁止的写法：「他手里有 X」「他一定听牌」—— 手牌服务端不下发，说得出就是编造
+- conf：低 / 中 / 高。证据不足一律写「低」，宁可低不要虚高
+- cards：你判断他**可能要**的牌值（最多 4 个），这些正是该进 blacklist 的方向
 
-## 三个作用
-1. 出牌推荐（mode=put）：从 me.hand 选一张可打的牌，action=put
-2. 避免点炮：输出 blacklist——现在手里**绝对不能打**的牌（打出去对手就能吃/碰/胡的方向，或拆掉自己必成的门子）。拿不准就空数组
-3. 特殊操作指导（mode=response，lastPut 是待响应的牌）——**必须先套用上面的铁律，再逐个评估 availableActions 里的每个动作，不许只算一个就下结论**：
-   - action=peng：碰。算清楚：手里是否真有 2 张 lastPut；碰后确定 +1 方门子（大字3息/小字1息）；
-     只有「这 2 张已经和别的牌组成了 possibleRuns/triples」才算真拆门子
-   - action=pass：过。**默认不是安全选项**——needMelds ≥ 3 时 pass 必须是「吃碰会拆散已成型门子」
-     这个具体理由，并明确指出拆的是哪一组
-   - action=hu：胡。**availableActions 含 hu 就必须选它**（放炮强制胡），先胡再谈其他
-   - action=eat：吃，**必须给 chiCards** = [lastPut, X, Y] 的具体组合（X/Y 来自手牌；组合只能是 一二三 / 二七十 / 大小同点绞）
-     吃和碰一样是 +1 方门子，不要因为是「吃」就轻视
-   - 只能从 availableActions 里选
+## 输出（只输出一个 JSON 对象，不要 Markdown、不要解释、不要其他文字）
+{"action":"put|peng|eat|hu|pass|none","card":牌值或null,"cards":[牌值...],"reason":"≤24字","blacklist":[牌值...],"chiCards":[牌值...]或null,"read":{"plan":"≤16字","conf":"低|中|高","cards":[牌值...]}}
 
-## 输出（只输出一个 JSON 对象，不要 Markdown、解释、其他文字）
-{"action":"put|peng|eat|hu|pass|none","card":牌值或null,"reason":"一句大白话≤24字","blacklist":[牌值...],"chiCards":[牌值...]或null}
+- **cards（仅 mode=put）**：推荐打的**多张**候选，按优先级排序，2~4 张；
+  第一张**必须**等于 `card`。都从 `analysis.putOrder` 里按顺序取，别自己另排。
+  只有一张确实最优时给 1 张（或干脆不写这个字段）。
 
-- put：card=要打的牌（必须在 me.hand 里，且不是 3/4 张同值）
-- eat：card=lastPut，chiCards=[lastPut, 手牌X, 手牌Y]
-- peng/hu：card=lastPut
-- pass/none：card=null，chiCards=null
-- blacklist：最多 3 张手牌（现在不能打的），拿不准就空数组
-- reason：大白话一句，≤24 字，不换行。**mode=response 时必须写出「吃/碰后到底拆了哪组门子」的比较结论**；
-  不要用「过能摸牌」这种放之四海皆准的空话（例：「碰7成1门，手里还有3对不亏」「吃七八九会拆101-103」）"""
+- put：card 在 me.hand 里，且不是 3 / 4 张同值
+- peng / hu：card = lastPut；eat：card = lastPut 且必须给 chiCards
+- pass / none：card = null，chiCards = null
+- blacklist：最多 3 张手牌，拿不准就空数组
+- reason：大白话一句，**不超过 18 个汉字**，不换行。
+  **所有数字必须写汉字**：牌值 1~10 写 一~十，101~110 写 壹~拾（**一个字**，
+  不要读成「壹零壹」），数量写 六 / 十五 / 二十。
+  写阿拉伯数字会显得很割裂（例：「吃3成句」要写成「吃三成句」）。
+  **不要写字段名**（needMelds / deckLeft / possibleRuns 之类）或英文，那会把长度顶爆导致整条建议作废。
+  错误示例：「吃三凑一二三成方，needMelds六远未听牌」（写字段名 + 超长，作废）
+  正确示例：「吃三成句，还差六方，先做门子」
+  mode=response 时必须写出「吃 / 碰到底拆了哪组门子」的比较结论，
+  不要用「过能摸牌」这种放之四海皆准的空话
+"""
 
 
 
@@ -233,7 +253,48 @@ def _valid_reason(reason) -> bool:
             and not any(ord(c) < 32 or ord(c) == 127 for c in reason))
 
 
+def _clean_cards(value, hand):
+    """多张候选：按模型给的顺序，最多 4 张，必须都在手里且不是 3/4 张同值。
+
+    只在 ≥2 张时才带出去 —— 单张和 card 重复，没必要多一个字段。
+    """
+    if not isinstance(value, list):
+        return []
+    out = []
+    for v in value:                      # ★ 扫全表、**输出**限 4 张。
+        if len(out) >= 4:                #   只扫前 4 项的话，模型把非法项排前面就会误杀。
+            break
+        if _card(v) and v in hand and v not in out and hand.count(v) < 3:
+            out.append(v)
+    return out
+
+
+def _clean_read(v):
+    """校验「猜牌」假设。**它不是事实**，所以只做形状校验，不参与任何动作判定。
+
+    红线：对手手牌服务端不下发。这里允许模型给假设，但要求它自带置信度，
+    并且 plan 里不许出现「有 / 一定 / 肯定」这类断言词 —— 那是编造。
+    """
+    if not isinstance(v, dict):
+        return None
+    plan = v.get("plan")
+    if type(plan) is not str:
+        return None
+    plan = plan.strip()
+    if not plan or len(plan) > 24:
+        return None
+    if any(w in plan for w in ("一定", "肯定", "确定有", "手里有")):
+        return None
+    conf = v.get("conf")
+    if conf not in ("低", "中", "高"):
+        conf = "低"                      # 拿不准就按最低置信度显示
+    cards = [c for c in (v.get("cards") or []) if _card(c)]
+    return {"plan": plan, "conf": conf, "cards": cards[:4]}
+
+
 _REQUIRED_KEYS = {"action", "card", "reason"}
+# read 是「对对手的假设」，可选。它永远不被当成事实——只用于提示人往哪个方向防。
+_OPTIONAL_KEYS = {"blacklist", "chiCards", "read", "cards"}
 
 
 def _clean_blacklist(value, hand):
@@ -279,7 +340,7 @@ def validate(state: dict, result) -> dict:
     if not _eligible(state) or not isinstance(result, dict):
         return _none()
     if not _REQUIRED_KEYS.issubset(result) or not set(result) <= (
-            _REQUIRED_KEYS | {"blacklist", "chiCards"}):
+            _REQUIRED_KEYS | _OPTIONAL_KEYS):
         return _none()
     action, card, reason = result["action"], result["card"], result["reason"]
     if type(action) is not str or not _valid_reason(reason):
@@ -287,13 +348,24 @@ def validate(state: dict, result) -> dict:
     if action == "none" and card is None:
         return _none()
     hand = _hand(state)
-    out = {"action": action, "card": card, "reason": reason,
+    # 数字统一转汉字：模型爱写「吃3成句，还差6方」，面板上读起来很割裂。
+    # 这里兜底转一次；提示词里也要求它直接写汉字。
+    out = {"action": action, "card": card, "reason": to_cn_text(reason),
            "blacklist": _clean_blacklist(result.get("blacklist"), hand),
            "chiCards": None}
+    # read 只在校验通过时才带出去；不合格就整块丢掉，宁可不显示也不显示错的假设。
+    read = _clean_read(result.get("read"))
+    if read is not None:
+        read["plan"] = to_cn_text(read["plan"])
+        out["read"] = read
     if state["mode"] == "put":
         if (action != "put" or not _card(card) or card not in hand
                 or hand.count(card) >= 3):
             return _none()
+        # 多张候选：首张必须就是 card，否则说明模型自相矛盾，丢掉候选只留首选。
+        cards = _clean_cards(result.get("cards"), hand)
+        if len(cards) >= 2 and cards[0] == card:
+            out["cards"] = cards
     else:
         actions = _response_actions(state)
         if action not in actions:
@@ -340,6 +412,8 @@ def ask(state: dict, api_key: str, timeout: float = 10.0) -> dict:
             "temperature": 0.2,
             "max_tokens": 300,
         }
+        if _THINK_OFF:
+            body["thinking"] = {"type": "disabled"}
         req = urllib.request.Request(
             API,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),

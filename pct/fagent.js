@@ -875,6 +875,12 @@ function aiRender(result) {
                 for (var ci = 0; ci < result.chiCards.length && ci < 3; ci++) cs.push(cardText(result.chiCards[ci]));
                 text += '[' + cs.join('') + ']';
             }
+            // 多张候选：首选之后还有能打的（按推荐顺序）
+            if (result.cards && result.cards.length > 1) {
+                var rest = [];
+                for (var ri = 1; ri < result.cards.length && ri < 4; ri++) rest.push(cardText(result.cards[ri]));
+                if (rest.length) text += '或' + rest.join('');
+            }
             if (result.reason) text += ' · ' + String(result.reason).slice(0, 16);
             // 黑榜：避免点炮——现在不能打的牌
             if (result.blacklist && result.blacklist.length) {

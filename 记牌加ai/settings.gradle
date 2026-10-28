@@ -1,0 +1,13 @@
+pluginManagement {
+    repositories { google(); mavenCentral(); gradlePluginPortal() }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
+    repositories {
+        google(); mavenCentral()
+        // Xposed API 不在 Maven Central 主仓库里，官方仓库在这里
+        maven { url 'https://api.xposed.info/' }
+    }
+}
+rootProject.name = "pct-bridge"
+include ':app'

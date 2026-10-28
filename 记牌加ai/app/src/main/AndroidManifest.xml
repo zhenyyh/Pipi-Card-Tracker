@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.pct.lsp">
+
+    <application android:label="记牌加AI" android:hasCode="true">
+        <!-- LSPatch / Xposed 靠这几条 meta 识别模块 -->
+        <meta-data android:name="xposedmodule" android:value="true" />
+        <meta-data android:name="xposeddescription"
+                   android:value="跑胡子记牌器数据桥：注入 collector.js，落 pct_state.json" />
+        <meta-data android:name="xposedminversion" android:value="54" />
+        <meta-data android:name="xposedscope" android:value="com.happyplay.hnphz" />
+    </application>
+</manifest>

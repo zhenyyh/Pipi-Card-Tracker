@@ -139,6 +139,7 @@ class Tracker:
         self.zhuang: Optional[int] = None      # 庄家座位号
         self.opp_is_zhuang = False
         self.dealt: List[int] = []      # 发牌顺序（未排序）
+        self.pass_chi: List[int] = []   # MJPass.mjpassChi 原样留档（语义未坐实，只记录）
         self.bottom_self: Optional[int] = None   # 自己当庄时的底牌
         self.bottom_ev: Optional[int] = None     # 开局 newCard 的 lastPut（最准）
         self._opened = False                     # 本局是否已见过第一条 newCard
@@ -321,6 +322,7 @@ class Tracker:
         self.bottom_self = None
         self._opened = False
         self.dealt = []
+        self.pass_chi = []
         self._opp_all_puts = []
 
     def _track_think(self, e: Dict[str, Any], name: str) -> None:
@@ -377,12 +379,40 @@ class Tracker:
             if len(samples) > 12:
                 samples.pop(0)
 
+    def _note_pass(self, d: Dict[str, Any]) -> None:
+        """把 `mjpassChi` 原样留档 —— 这是全工程唯一一份「过张」证据。
+
+        `MJPut` / `MJPass` 的负载里都带这个数组：一张牌被打出去、没人吃碰胡，
+        它就进这个列表。语义上等于「这张牌对某一家没用」，是**能削弱对手手牌
+        假设的公开证据**，比思考时长硬。
+
+        ★ 只记录，不进推断：实测同一局里不同事件带回的版本长度和内容对不上
+          （座位 0 的 `MJPut` 带的是全局列表，座位 1 的只含自己打过的），
+          到底按全局还是按座位算还没坐实。没坐实的口径进 AI 就是编造，
+          所以这里只取最长的那一份留档，等 `tools/probe_pass.py` 把语义定下来
+          再接推断层。
+        """
+        pc = d.get("mjpassChi")
+        if not isinstance(pc, list):
+            return
+        vals = []
+        for c in pc:
+            try:
+                iv = int(c)
+            except (TypeError, ValueError):
+                return
+            if 1 <= iv <= 110:
+                vals.append(iv)
+        if len(vals) > len(self.pass_chi):
+            self.pass_chi = vals
+
     def _on_event(self, e: Dict[str, Any], quota: Optional[Counter] = None,
                   opp_snapshot: Optional[Dict[str, Any]] = None) -> None:
         """处理一条事件。出牌要消耗 quota 里的一份额度，用完的不记（重发）。"""
         name = e.get("e")
         d = e.get("d") or {}
         self._track_think(e, name)
+        self._note_pass(d)
 
         # ★ mjhand：发牌事件。d.mjhand 是**未排序的发牌顺序**（sData 里那份是
         #   排过序的，所以之前从 sData 取 hand[20] 永远取不到底牌）。
@@ -611,12 +641,18 @@ class Tracker:
             if isinstance(xc, int) and xc > 0:
                 bottom = xc
         if bottom is None:
-            for c in (live.get("caiPaiArr") or []):
+            # ★ caiPaiArr 在旧流里是 {uid: 牌值} 的字典，直接 for 会遍历出 uid，
+            #   int("5513337") > 0 就把 uid 当成底牌记下（实测旧 fixture 踩到）。
+            #   字典只取 values，数组照旧。
+            cai = live.get("caiPaiArr")
+            if isinstance(cai, dict):
+                cai = list(cai.values())
+            for c in (cai or []):
                 try:
                     iv = int(c)
                 except (TypeError, ValueError):
                     continue
-                if iv > 0:
+                if 1 <= iv <= 110:
                     bottom = iv
                     break
         self.bottom = bottom
@@ -638,6 +674,7 @@ class Tracker:
             "melds": [{"kind": m.kind, "cards": m.cards, "after": m.after}
                       for m in self.melds],
             "puts": list(self.puts),
+            "passed": list(self.pass_chi),
             "left": list(self.left),
         }
 
@@ -701,6 +738,172 @@ class Tracker:
         cn = self._card_next or 0
         return max(0, total - cn)
 
+    # --------------------------------------------------------------- 总牌守恒
+    # 每一条都是踩出来的，不要删：
+    #
+    # ① 池不是 80。二人房 choupai=20 把 20 张抽走，池 = 60。
+    #    拿 80 去对账差 20，会误判成「采集漏了」。
+    # ② **已易主的那张要剪掉**。胡牌那张从出牌方的 put 转进赢家手牌，
+    #    但 put 里不会把它移除 —— 于是它同时算进「赢家手牌」和「出牌方弃牌」，
+    #    凭空多 1 张。实测第 10 局：lastPut=105 在对手 put=[9,101,105] 里，
+    #    同时也在赢家手牌里，61 就是这 1 张。判据见 _clip_reowned()。
+    # ③ 偎(peng1) / 提(gang0) / 跑(gang1) 在数组里**一个元素 = 一组**，不是一张：
+    #    peng1 一组 3 张，gang0 / gang1 一组 4 张。
+    #    把 [109,107] 当 2 张算，会少 4 张。
+    # ④ 吃 / 绞 在 mjchi 里 3 张一组，按 len // 3 拆。
+    # ⑤ 摆火 mjlie 一个元素 = 1 张（单张亮出）。
+    # ⑥ 局中只有本人 hand 是真的；对手 handN 可能是 0。缺项要报 unknown，
+    #    不能拿 0 当真实值去凑 —— 凑出来的守恒是假的。
+    # ⑦ 只有结算（tState=6）两家 hand 都有值，这时才能算完整账。
+    # ⑧ deck_left 要 clamp 到 0：旧房间 cardNext 可能超过池。
+    MELD_UNIT = {"peng": 3, "peng1": 3, "gang0": 4, "gang1": 4, "lie": 1}
+
+    def _seat_cards(self, seat: Dict[str, Any]) -> Dict[str, Any]:
+        """一家的「手 / 弃 / 明」三堆各几张，按上面 ③④⑤⑥ 的口径。"""
+        hand = seat.get("hand") or []
+        melds = 0
+        for key, unit in self.MELD_UNIT.items():
+            melds += len(seat.get(key) or []) * unit
+        chi = seat.get("chi") or []
+        melds += (len(chi) // 3) * 3
+        # 空手牌 / 字段不存在 / 明确标记未知，三件事要分开：
+        #   显式 False        → 未知
+        #   显式 True         → 已知（哪怕 0 张，胡完把手牌全打进明牌是合法的）
+        #   没有这个键（旧快照）→ 有内容就算已知，空的按未知（分不清 0 和没读到）
+        flag = seat.get("handKnown")
+        if flag is False:
+            known = False
+        elif flag is True:
+            known = True
+        else:
+            known = len(hand) > 0
+        return {
+            "hand": len(hand),          # 手牌张数
+            "handKnown": known,
+            "puts": len(seat.get("put") or []),
+            "melds": melds,
+        }
+
+    def _clip_reowned(self):
+        """找出「换了主人却被数两遍」的那张牌。返回 [(牌值, 座位号)]。
+
+        判据（不猜）：`lastPut` 出现在**赢家手牌**里 —— 说明这张是胡牌那张，
+        已经被赢家拿走了。既然如此，它就不可能还留在任何人的弃牌堆里；
+        谁家的 put 里还有它，就从谁家剪掉一张。
+
+        这条同时覆盖 README 里更早记下的那个变体
+        「lastPut 出现在非 lastPutPlayer 的堆里（已易主）」：
+        自摸时 lastPut 就是赢家自己摸的那张，不进任何人 put，自然不会剪。
+        """
+        lp = self._last_put
+        if not isinstance(lp, int) or not (1 <= lp <= 110):
+            return []
+        if self.winner is None or self.winner < 0:
+            return []
+
+        # 赢家手牌里有没有这张（多重集比较，同值多张时只剪对应张数）
+        win_seat = None
+        for s in self._seats:
+            if s.get("seat") == self.winner:
+                win_seat = s
+                break
+        if win_seat is None:
+            return []
+        hand = [int(c) for c in (win_seat.get("hand") or []) if isinstance(c, int)]
+        if lp not in hand:
+            return []
+
+        out = []
+        for s in self._seats:
+            if s.get("seat") == self.winner:
+                continue                      # 赢家自己的 put 不会有这张
+            if lp in [int(c) for c in (s.get("put") or []) if isinstance(c, int)]:
+                out.append((lp, s.get("seat")))
+        return out
+
+    def _reowned_candidates(self):
+        """哪些牌**可能**也「已经易主」—— 只报，不剪。
+
+        除了胡牌那张，理论上吃 / 碰 / 绞 拿走的牌也可能留在出牌方的 put 里，
+        同样会被数两遍。但目前**只有胡牌这条有实证**（第 10 局 105、multi4 的 109），
+        吃碰这条没有干净的实机样本可判 —— round_kan 差 1 且剪不掉，就是这个形状。
+
+        所以这里列出来供人判断，**不参与对账**。等攒到一局「吃/碰 之后正好对不上」
+        的实机数据，再决定要不要把它们也剪掉。
+        """
+        seen, out = set(), []
+        for a in self._seats:
+            puts = [int(c) for c in (a.get("put") or []) if isinstance(c, int)]
+            if not puts:
+                continue
+            for b in self._seats:
+                if b.get("seat") == a.get("seat"):
+                    continue
+                groups = []
+                for key, unit in (("peng", 3), ("peng1", 3), ("gang0", 4), ("gang1", 4)):
+                    for c in (b.get(key) or []):
+                        groups.append((key, int(c)))
+                chi = [int(c) for c in (b.get("chi") or []) if isinstance(c, int)]
+                for i in range(0, len(chi) - 2, 3):
+                    groups.append(("chi", chi[i]))
+                for kind, card in groups:
+                    if kind == "chi":
+                        hit = [c for c in chi if c in puts]
+                        if not hit:
+                            continue
+                        card = hit[0]
+                    elif card not in puts:
+                        continue
+                    key = (card, a.get("seat"), b.get("seat"))
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append({"card": card, "from": a.get("seat"),
+                                "to": b.get("seat"), "kind": kind})
+        return out
+
+    def conservation(self) -> Dict[str, Any]:
+        """总牌守恒：手牌 + 弃牌 + 明牌 + 墩剩 = 池。
+
+        返回的是**可对账的诊断**，不是一句 True/False：
+        `diff == 0` 才算对得上；`unknown` 非空说明这一局根本算不了完整账
+        （局中、或对手 hand 没下发），此时不要拿 diff 下结论。
+        """
+        pool = 80 - (self.choupai or 20)
+        deck = max(0, pool - (self._card_next or 0))
+        clips = self._clip_reowned()
+
+        seats, unknown = [], []
+        for s in self._seats:
+            c = self._seat_cards(s)
+            clipped = sum(1 for _card, seat_no in clips if seat_no == s.get("seat"))
+            if not c["handKnown"]:
+                # 手牌没下发 ≠ 手牌 0 张。局中对手就是这样，记成未知而不是 0。
+                unknown.append({"seat": s.get("seat"), "why": "hand 未下发"})
+            seats.append({
+                "seat": s.get("seat"),
+                "uid": s.get("uid"),
+                "hand": c["hand"],
+                "handKnown": c["handKnown"],
+                "puts": c["puts"],
+                "putsClipped": c["puts"] - clipped,   # 剪掉已易主那张之后
+                "melds": c["melds"],
+                "clipped": clipped,
+            })
+
+        total = sum(x["hand"] + x["putsClipped"] + x["melds"] for x in seats) + deck
+        return {
+            "pool": pool,
+            "deckLeft": deck,
+            "seats": seats,
+            "clipped": clips,
+            "candidates": self._reowned_candidates(),
+            "sum": total,
+            "diff": total - pool,
+            "ok": (total == pool) and not unknown,
+            "unknown": unknown,
+        }
+
     def _hand_analysis(self) -> Dict[str, Any]:
         """替 AI 把牌型算清楚：门子数、对子/坎、能凑的句、还差几方。
 
@@ -726,6 +929,44 @@ class Tracker:
                 if all(cnt.get(c, 0) > 0 for c in trio):
                     runs.append(trio)
 
+        # ---- 真孤张排序：把「先打哪张」算成一个确定顺序，别让模型自己排 ----
+        # 模型排过两次，两次都在 7 和 106 之间摇摆，还拆过对子。排序是确定性的
+        # 机械活，交给代码；模型只负责在 blacklist 之外挑第一个。
+        seen = self._seen_cards()
+        run_members = set()
+        for r in runs:
+            run_members.update(r)
+        singles = [c for c, n in cnt.items()
+                   if n == 1 and c not in run_members and c not in triples]
+
+        def _order_key(c: int):
+            num = c - 100 if c >= 100 else c
+            seen_n = seen.get(c, 0)
+            return (
+                0 if seen_n >= 2 else 1,      # a. 已现 2~3 张的先打（剩得少，留着无用）
+                0 if num in (1, 10) else 1,   # b. 边张先于中张（中张连接性好）
+                0 if c < 100 else 1,          # c. 小字先于大字（宁小莫大）
+                c,                             # d. 同档取牌值最小 —— 保证结论稳定
+            )
+
+        # ---- 合法吃法：也在代码里算好 ----
+        # 实测模型会编「吃 3 拆不成句」来给 pass 找理由，而手里 1、2 明明能成 一二三。
+        # 能吃不能吃是可枚举的事实，不该交给模型自由心证。
+        eat_options = []
+        lp = self._last_put
+        if isinstance(lp, int) and 1 <= lp <= 110:
+            num = lp - 100 if lp >= 100 else lp
+            off = 100 if lp >= 100 else 0
+            for base in ((1, 2, 3), (2, 7, 10)):
+                if num in base:
+                    others = [b + off for b in base if b != num]
+                    if all(cnt.get(c, 0) > 0 for c in others):
+                        eat_options.append([lp] + others)
+            # 绞：手里两张「同点异大小写」，再来一张同值的就能成绞
+            for c in (lp + 100, lp - 100):
+                if 1 <= c <= 110 and cnt.get(c, 0) >= 2:
+                    eat_options.append([lp, c, c])
+
         return {
             "meldCount": meld_n,                      # 已成型门子数
             "needMelds": max(0, 7 - meld_n),          # 还差几方到胡
@@ -733,7 +974,9 @@ class Tracker:
             "triples": triples,                        # 坎（可提/跑）
             "possibleRuns": runs,                      # 手里能凑出的一句话
             "singleCount": sum(1 for n in cnt.values() if n == 1),   # 孤张数量
-            "seen": self._seen_cards(),
+            "putOrder": sorted(singles, key=_order_key),  # 出牌顺序（已排好，直接用）
+            "eatOptions": eat_options,                 # 合法吃法（空 = 真吃不了）
+            "seen": seen,
         }
 
     def _seen_cards(self) -> Dict[int, int]:

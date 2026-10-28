@@ -1,0 +1,4 @@
+// LSPatch 模块只需要 library 插件，不要 application
+plugins {
+    id 'com.android.library' version '8.1.4' apply false
+}

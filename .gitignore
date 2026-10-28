@@ -3,3 +3,9 @@ __pycache__/
 data/
 .pct/
 .workbuddy/
+
+# 记牌加AI 模块：构建产物 / 密钥 / 素材 APK 不进仓库
+记牌加ai/build_manual/
+素材/
+data/
+*.jks

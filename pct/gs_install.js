@@ -42,6 +42,17 @@
         return a;
     }
 
+    // caiPaiArr 实机是 {uid: 牌值} 的字典，不是数组 —— 直接 arr() 只会得到 []，
+    // 底牌就永远兜不到。字典取 values。
+    function dictVals(v, n) {
+        if (Object.prototype.toString.call(v) !== '[object Object]') return arr(v, n);
+        var out = [], lim = n || 8;
+        for (var k in v) {
+            if (Object.prototype.hasOwnProperty.call(v, k) && out.length < lim) out.push(v[k]);
+        }
+        return out;
+    }
+
     // 本人操作栏的可见按钮是游戏 UI 的直接证据；找不到或不唯一时返回未知。
     // 缓存节点避免每次事件都遍历场景。所有祖先可见才算真正显示。
     var controlScene = null, controlPanel = null, lastPanelSearch = 0;
@@ -90,6 +101,40 @@
         var o = {};
         try {
             var sd = jsclient.data && jsclient.data.sData;
+            // 场景名：用于面板区分「大厅/列表」和「牌桌」——退回列表时秒清要用
+            try {
+                var _sc = (typeof cc !== 'undefined' && cc.director) ? cc.director.getRunningScene() : null;
+                o.scene = _sc ? String(_sc.constructor.name) : '';
+                if (!o.scene && _sc) o.scene = String(_sc);           // 匿名类时的兜底
+                o.sceneOk = !!_sc;
+            } catch (e) {
+                o.scene = '';
+                o.sceneErr = String(e);   // ★ 把失败原因带出来，别静默吞掉
+            }
+            // ★ 换房清事件流：tableid 变了（新房间）→ 上一局的事件全部作废。
+            //   否则新局里 ev 还带着上一局的 newCard/MJPut，面板的底牌/首出/门子
+            //   会把旧局的内容捡回来（用户实测：重启才干净，就是这个原因）。
+            try {
+                var _tid = sd.tData ? sd.tData.tableid : undefined;
+                var _prev = jsclient['__pct_tid'];
+                var _q = jsclient[Q];
+                if (_prev !== undefined && _tid !== undefined
+                        && String(_tid) !== String(_prev) && _q && _q.length) {
+                    _q.length = 0;   // ★ 换房：清空事件队列源头（o.ev 只是切片副本）
+                }
+                jsclient['__pct_tid'] = _tid;
+            } catch (e) { }
+            // ★ tData 标量全量导出（调试底牌字段用：小8 在 tData 的哪个字段里）
+            try {
+                var _td = sd.tData;
+                if (_td) {
+                    o.tdump = {};
+                    for (var _k in _td) {
+                        var _v = _td[_k];
+                        if (typeof _v !== 'object' || _v === null) o.tdump[_k] = _v;
+                    }
+                }
+            } catch (e) { }
             if (!sd) { o.none = 1; return o; }
             var t = sd.tData || {};
             var me = 0;
@@ -110,7 +155,7 @@
             o.leftCards = arr(t.leftCards, 60);
             o.xingCard = t.xingCard;
             // 底牌候选：醒牌(xingCard) 经常是 -1，财牌数组(caiPaiArr) 是另一套来源
-            o.caiPaiArr = arr(t.caiPaiArr, 8);
+            o.caiPaiArr = dictVals(t.caiPaiArr, 8);
             o.sliceCard = t.sliceCard;
             o.firstSend = t.firstSend;
             o.winner = t.winner;
@@ -128,7 +173,7 @@
             for (var i = 0; i < o.uids.length; i++) {
                 var u = o.uids[i];
                 var p = ps[String(u)] || ps[u] || {};
-                seats.push({
+                var seat = {
                     uid: u,
                     seat: i,
                     put: arr(p.mjput, 60),
@@ -155,7 +200,24 @@
                         return Object.prototype.toString.call(p[k]) === '[object Array]';
                     }),
                     state: p.mjState
-                });
+                };
+                // ---- 2026-10-28 实机枚举补的字段 ----
+                // 只推**确实存在**的键：arr(undefined) 会返回 []，那就把「没这个字段」
+                // 伪装成「字段为空」，正是本项目反复踩的「空数组 ≠ 不存在」。
+                if ('onLine' in p) seat.onLine = p.onLine;          // 对手掉线时牌局停摆，别误判成卡死
+                if ('needOneCard' in p) seat.needOneCard = p.needOneCard;  // 待考证：疑似「差一张」
+                if ('sishou' in p) seat.sishou = p.sishou;
+                if ('piaoSet' in p) seat.piaoSet = p.piaoSet;
+                if ('piaoType' in p) seat.piaoType = p.piaoType;
+                if ('mjputHand' in p) seat.putHand = arr(p.mjputHand, 60);  // 每家自己打出的牌
+                if ('mjpengFrom' in p) seat.pengFrom = p.mjpengFrom;        // 碰的来源座位
+                // 下面这几个只在本人那一份里出现（对照实测：对手对象没有这些键）
+                if ('cannotPut' in p) seat.cannotPut = arr(p.cannotPut, 40);
+                if ('mjpassPeng' in p) seat.passPeng = arr(p.mjpassPeng, 40);
+                if ('mjpassChi' in p) seat.passChi = arr(p.mjpassChi, 40);
+                if ('eatFlag' in p) seat.eatFlag = p.eatFlag;
+                if ('kingHuFlag' in p) seat.kingHuFlag = p.kingHuFlag;
+                seats.push(seat);
             }
             o.seats = seats;
         } catch (e) { o.err = String(e); }
@@ -186,6 +248,10 @@
         }
         var q = jsclient[Q];
         if (!q) { q = jsclient[Q] = []; }
+        // ★ mjhand = 发牌 = 新一局开始：旧局事件全部作废。
+        //   否则上一局没走到结算就退出时，roundEnd 边界失效，新局的
+        //   底牌/首出/门子会把旧局的 newCard/MJPut 捡回来（用户实测「底牌大四串局」）。
+        if (nm === 'mjhand') { q.length = 0; }
         q.push(rec);
         if (q.length > 240) q.splice(0, q.length - 240);
         flush();
@@ -277,6 +343,9 @@
         }
         var q = jsclient[Q];
         if (!q) { q = jsclient[Q] = []; }
+        // ★ mjhand = 发牌 = 新一局开始：旧局事件作废（这条是 pomelo.decode 路径，
+        //   之前漏了，导致回放串局 —— 用户实测）
+        if (nm === 'mjhand') { q.length = 0; }
         q.push(rec);
         if (q.length > 240) q.splice(0, q.length - 240);
     }
