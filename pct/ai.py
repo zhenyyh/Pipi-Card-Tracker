@@ -8,6 +8,7 @@ import os
 import time
 from . import rules
 import logging
+import urllib.error
 import urllib.request
 
 API = "https://api.deepseek.com/chat/completions"
@@ -28,6 +29,16 @@ SYSTEM_PROMPT = """你是二人跑胡子助手。只根据输入中已确认的�
 - singleCount 孤张数量（越大越该先打孤张）
 - seen 已经露面的牌各几张（含你的手牌/双方门子/双方弃牌；对手暗牌与墩里未知）——
   用它算「还剩几张可等」
+
+## 本房间规则（state.roomRules，硬约束，优先于下面所有策略）
+- **胡牌 = 7 方门子 + 胡息 ≥ minHuXi**（minHuXi 是起胡线，本房间 15）。
+  门子凑够但胡息不够不能胡——所以「涨息」有明确目标值，不是漫无目的往上堆。
+- **放炮 = 你打出的牌被别人胡掉，你要扣掉对方那份胡息**。这就是 blacklist 的意义：
+  危险期宁可退熟张、宁可拆牌，也绝不往对手门子方向送牌。放炮的代价远大于少 3 息。
+- **自摸：胡息 ×2**。能自己摸到，收益是等别人打的两倍。
+- **放炮强制胡**：`availableActions` 里只要含 `hu`，就必须选 `hu`——不存在「过」这个选项。
+  漏胡一次等于白送一局，这是最严重的错误。
+- 玩法名见 ruleName（本房间是娄底放炮罚）。
 
 ## 实战策略（高手经验，按条件执行）
 ### 出牌（mode=put）
@@ -74,7 +85,7 @@ SYSTEM_PROMPT = """你是二人跑胡子助手。只根据输入中已确认的�
      只有「这 2 张已经和别的牌组成了 possibleRuns/triples」才算真拆门子
    - action=pass：过。**默认不是安全选项**——needMelds ≥ 3 时 pass 必须是「吃碰会拆散已成型门子」
      这个具体理由，并明确指出拆的是哪一组
-   - action=hu：胡
+   - action=hu：胡。**availableActions 含 hu 就必须选它**（放炮强制胡），先胡再谈其他
    - action=eat：吃，**必须给 chiCards** = [lastPut, X, Y] 的具体组合（X/Y 来自手牌；组合只能是 一二三 / 二七十 / 大小同点绞）
      吃和碰一样是 +1 方门子，不要因为是「吃」就轻视
    - 只能从 availableActions 里选
@@ -268,8 +279,17 @@ def validate(state: dict, result) -> dict:
                 or hand.count(card) >= 3):
             return _none()
     else:
-        if action not in _response_actions(state):
+        actions = _response_actions(state)
+        if action not in actions:
             return _none()
+        # ★ 放炮强制胡：能胡就必须胡，模型选了别的动作一律纠正。
+        #   考证见 docs/FINDINGS.md §3.4「放炮强制胡；其他胡牌需要胡自己或其他
+        #   玩家摸的牌」。这条是规则不是策略，不能交给模型自由裁量——漏胡一次
+        #   等于白送一局，代价远大于任何「等更好的牌」的收益。
+        if "hu" in actions and action != "hu":
+            return {"action": "hu", "card": state["lastPut"],
+                    "reason": "能胡必胡（放炮强制胡）",
+                    "blacklist": [], "chiCards": None}
         if action == "pass":
             if card is not None:
                 return _none()
@@ -313,6 +333,20 @@ def ask(state: dict, api_key: str, timeout: float = 10.0) -> dict:
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
+    except urllib.error.HTTPError as exc:
+        # 402 = 账户余额不足，401/403 = 密钥失效。这两种要分别提示，
+        # 否则界面只有一个笼统的「请求失败」，用户分不清是没钱还是没网。
+        if exc.code == 402:
+            _LOG.warning("AI 请求失败：账户余额不足")
+            _trace({"kind": "response", "error": "insufficient_balance"})
+            return _failure("AI余额不足")
+        if exc.code in (401, 403):
+            _LOG.warning("AI 请求失败：密钥无效(%s)", exc.code)
+            _trace({"kind": "response", "error": "unauthorized"})
+            return _failure("AI密钥无效")
+        _LOG.warning("AI 请求失败（HTTP %s）", exc.code)
+        _trace({"kind": "response", "error": "http_%s" % exc.code})
+        return _failure("AI请求失败")
     except Exception as exc:
         # 不记录异常内容、响应正文或密钥，避免泄露请求凭据。
         _LOG.warning("AI 请求失败（%s）", type(exc).__name__)

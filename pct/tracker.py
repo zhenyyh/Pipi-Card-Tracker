@@ -787,8 +787,28 @@ class Tracker:
                                 if isinstance(self._visible_actions, list)
                                 and self._visible_actions else None),
             "analysis": self._hand_analysis(),
-            "roomRules": dict(self._room_rules),
+            "roomRules": self._room_rules_explained(),
         }
+
+    def _room_rules_explained(self) -> Dict[str, Any]:
+        """把房间原始参数翻译成 AI 看得懂的口径。
+
+        ★ 原样发 {"huziType":2,"limitScore":15,"playType":10000110} 等于没发——
+        模型不认识这三个裸数字，而它们恰恰决定了「胡息要够多少才能胡」和
+        「放炮要扣多少分」。含义来自 docs/FINDINGS.md §3.4 的客户端考证。
+        """
+        raw = dict(self._room_rules)
+        huzi = raw.get("huziType")
+        limit = raw.get("limitScore")
+        # 只翻译已考证确定的部分；拿不准的保留原值，不臆测含义。
+        name = {2: "娄底放炮罚"}.get(huzi)
+        out: Dict[str, Any] = {
+            "ruleName": name or "未考证(huziType=%s)" % huzi,
+            "minHuXi": limit if type(limit) is int else None,
+        }
+        if raw:
+            out["raw"] = raw
+        return out
 
     def debug(self) -> str:
         parts = []
