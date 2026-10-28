@@ -1,0 +1,377 @@
+跑胡子规则
+跑胡子，小写“一”到“十”各4张共40张，大写“壹”到“拾”各4张共40张。
+
+砌牌：跑胡子为3人同玩，庄家砌21张，其他方位砌20张，留19张在墩上。
+
+一对牌：手中2个相同的牌为1对。
+
+一坎牌：手中3个相同的牌为1坎。
+
+一提牌：手中4个相同的牌为1提。
+
+一句话：砌牌后，手中的牌依据规则组合成相连的三张，比如小四、五、六，称为一句话。另外二、七、十组合也称为一句话。
+
+绞牌(混对)：当1对大牌与1张相同的小牌，或者1对小牌与1张相同的大牌组合时，成为绞牌。如1对小九与1张大玖。
+
+跑胡子从胡牌算法上跟麻将有许多相似之处，但比一般麻将规则更复杂一些：
+1.几组牌（三张一组）+将（一对），跑胡子可以没将
+
+2.都有：一句话（顺子）、提（杠）、坎（碰）、对（将），而跑胡子多一种绞牌及二七十特殊牌组
+
+3.跑胡子还有最小胡息、翻数、翻醒、跟醒等更复杂的算分逻辑
+
+4.此算法简单修改后可适用麻将,并且涵盖听牌功能
+
+再讲讲回溯算法
+回溯算法，在我看来是一种用递归方式穷举所有解的算法，写的差的回溯算法跟穷举方法的效率差不多，甚至更差（代码可读性差、递归占用较多堆栈、更容易出错），但好的回溯算法结合了优秀的”截枝逻辑”，可以使算法效率提升非常多倍的同时，还能得到所有需要的解。总的来，当你想得到一种、多种甚至所有解的时候，使用穷举效率又太慢，这时回溯算法就是很好的选择。
+
+跑胡子，就很适合用回溯法求解，一是因为当它有赖子牌（万能牌）时，会出现很多种不同的解。二是由于它复杂的算分系统。让求最优解（得分最高）成为一件较难的问题。
+
+已实现java版跑胡子胡牌算法，因算分规则复杂多变，本算法并不返回一个最优解，而是得到所有解。效率经测试:1ms以内。
+
+第一代核心算法
+这是第一代核心算法目的是得到所有的解，还有很大的优化空间，比如顺子混对只能用1个癞子，坎可以加一张王组合成提等。
+
+
+
+
+
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.IntStream;
+
+public class CanHu {
+
+    /**
+     * 牌数组,索引=牌id,值=牌数量
+     */
+    int[] paiArr;
+
+    /**
+     * 剩余牌的数量,只有全部拆完才算胡
+     */
+    int lastNum;
+
+    /**
+     * 是否自摸
+     */
+    boolean isZiMo;
+
+    /**
+     * 进牌id
+     */
+    int fromPaiId;
+
+    /**
+     * 对子的类型
+     */
+    public static final int SHUNZI = 1, HUNDUN = 2, KAN = 3, TI = 4, DUIZI = 5, S2710 = 6;
+
+    /**
+     * 占的二进制位数
+     */
+    public static final int bitType = 3, bitPai = 5;
+
+    /**
+     * 占的二进制字节
+     */
+    public static final int byteType = 0x7, bytePai = 0x1F;
+
+    /**
+     * 保存所有可以胡的牌型
+     */
+    List<Long> duiList = new ArrayList<Long>();
+
+    /**
+     * 所有可以胡牌型用到的癞子保存在这里
+     */
+    List<Integer> laiZiList = new ArrayList<Integer>();
+
+    /**
+     * 牌对应的id,字牌:小一=1...小十=10,大壹=11...大拾=20,王(癞子)=21
+     */
+    public static final int MAX_PAI_CNT = 22;
+    public static final int WANG = 21;
+    public static final int DA_SHI = 20;
+    public static final int XIAO_YI = 1;
+
+    public CanHu(int[] paiArr, int fromPaiId, boolean isZiMo) {
+        this.paiArr = paiArr;
+        this.fromPaiId = fromPaiId;
+        this.isZiMo = isZiMo;
+
+        lastNum = IntStream.of(paiArr).sum();
+    }
+
+    public void takeOffAll() {
+
+        long dui = 0;
+
+        // 手里有3张以上相同的不可以拆
+        for (int i = XIAO_YI; i <= DA_SHI; i++) {
+            if (paiArr[i] >= 3 && i != fromPaiId) {
+                dui = pushDui(dui, i, paiArr[i] == 3 ? KAN : TI);
+                lastNum -= paiArr[i];
+                paiArr[i] = 0;
+            }
+        }
+
+        takeOffAll(XIAO_YI, dui);
+    }
+
+    public void takeOffAll(int paiId, long dui) {
+
+        // 剩余3张以内的 0是拆完了可以胡 1不能胡 2刚好是个将就可以胡
+        if (lastNum < 3) {
+            if (lastNum == 0) {
+                // 能胡
+                duiList.add(dui);
+
+                // 保存癞子代替的牌
+                int laizi = 0;
+                for (int i = XIAO_YI; i <= DA_SHI; i++) {
+                    for (int j = paiArr[i]; j < 0; j++) {
+                        laizi = laizi << bitPai | i;
+                    }
+                }
+                laiZiList.add(laizi);
+
+            } else if (lastNum == 2) {
+                // 剩余2张能否做将
+                takeOffJiang(dui);
+            }
+
+            return;
+        }
+
+        for (int i = paiId; i <= DA_SHI; i++) {
+            // 4张相同的
+            takeOffSame(i, 4, TI, dui);
+            // 3张相同的
+            takeOffSame(i, 3, KAN, dui);
+            // 2710
+            takeOff2710(i, dui);
+            // 拆顺子
+            takeOff123(i, dui);
+            // 拆混对
+            takeOffHunDui(i, dui);
+        }
+    }
+
+    public void takeOffJiang(long dui) {
+        int wangNum = paiArr[WANG];
+        int paiNum = 2 - wangNum;
+        paiArr[WANG] = 0;
+
+        for (int i = XIAO_YI; i <= DA_SHI; i++) {
+
+            if (paiArr[i] == paiNum) {
+
+                paiArr[i] -= 2;
+                lastNum -= 2;
+
+                takeOffAll(MAX_PAI_CNT, pushDui(dui, i, DUIZI));
+
+                paiArr[i] += 2;
+                lastNum += 2;
+            }
+        }
+
+        paiArr[WANG] += wangNum;
+    }
+
+    public void takeOffSame(int i, int cnt, int type, long dui) {
+        if (paiArr[i] + paiArr[WANG] >= cnt) {
+            int needWang = cnt - paiArr[i];
+
+            if (needWang > 0) {
+                paiArr[WANG] -= needWang;
+            }
+            paiArr[i] -= cnt;
+            lastNum -= cnt;
+
+            takeOffAll(i, pushDui(dui, i, type));
+
+            lastNum += cnt;
+            paiArr[i] += cnt;
+            if (needWang > 0) {
+                paiArr[WANG] += needWang;
+            }
+        }
+    }
+
+    public void takeOff123(int i, long dui) {
+        // 处理边界的问题,9 10 11变成顺子的问题
+        int border = (i - 1) % 10;
+        if (border > 7) {
+            return;
+        }
+
+        int i1 = i + 1;
+        int i2 = i + 2;
+
+        takeOffSingle(i, i1, i2, SHUNZI, dui);
+    }
+
+    public void takeOff2710(int i, long dui) {
+        // 只有是2的时候才组合2710
+        if (i % 10 != 2) {
+            return;
+        }
+
+        int i1 = i + 5;
+        int i2 = i + 8;
+
+        takeOffSingle(i, i1, i2, S2710, dui);
+    }
+
+    public void takeOffSingle(int i, int i1, int i2, int type, long dui) {
+        int needWang = 0;
+
+        if (paiArr[i] < 1)
+            needWang++;
+
+        if (paiArr[i1] < 1)
+            needWang++;
+
+        if (paiArr[i2] < 1)
+            needWang++;
+
+        if (paiArr[WANG] >= needWang) {
+            paiArr[WANG] -= needWang;
+
+            paiArr[i]--;
+            paiArr[i1]--;
+            paiArr[i2]--;
+            lastNum -= 3;
+
+            takeOffAll(i, pushDui(dui, i, type));
+
+            lastNum += 3;
+            paiArr[i]++;
+            paiArr[i1]++;
+            paiArr[i2]++;
+
+            paiArr[WANG] += needWang;
+        }
+    }
+
+    public void takeOffHunDui(int i, int relatePai, long dui) {
+        paiArr[i] -= 2;
+        paiArr[relatePai]--;
+        lastNum -= 3;
+
+        takeOffAll(i, pushDui(dui, i, HUNDUN));
+
+        lastNum += 3;
+        paiArr[i] += 2;
+        paiArr[relatePai]++;
+
+    }
+
+    public void takeOffHunDui(int i, long dui) {
+        int relatePai = i > 10 ? i - 10 : i + 10;
+        if (paiArr[i] >= 1 && paiArr[relatePai] >= 1) {
+
+            if (paiArr[i] >= 2) {
+                takeOffHunDui(i, relatePai, dui);
+            } else if (paiArr[WANG] >= 1) {
+                paiArr[WANG]--;
+                takeOffHunDui(i, relatePai, dui);
+                paiArr[WANG]++;
+
+            }
+
+        }
+    }
+
+    public static long pushDui(long dui, int paiId, int type) {
+        return (dui << bitType | type) << bitPai | paiId;
+    }
+
+    public static List<Integer> popDui(long dui) {
+        int paiId = (int) (dui & bytePai);
+        int type = (int) (dui >>> bitPai & byteType);
+
+        switch (type) {
+        case TI:
+            return Arrays.asList(paiId, paiId, paiId, paiId);
+        case KAN:
+            return Arrays.asList(paiId, paiId, paiId);
+        case SHUNZI:
+            return Arrays.asList(paiId, paiId + 1, paiId + 2);
+        case S2710:
+            return Arrays.asList(paiId, paiId + 5, paiId + 8);
+        case HUNDUN:
+            int relatePai = paiId > 10 ? paiId - 10 : paiId + 10;
+            return Arrays.asList(paiId, paiId, relatePai);
+        case DUIZI:
+            return Arrays.asList(paiId, paiId);
+        }
+
+        return Arrays.asList();
+    }
+
+    public static void main(String[] args) {
+//      int arr[]={0, 0, 2, 0, 4, 0, 0, 3, 0, 0, 0, 4, 2, 0, 0, 0, 0, 1, 0, 1, 1, 3};
+//      int map[]= {0, 0, 0, 0, 0, 0, 1, 1, 3, 1, 0, 0, 0, 0, 1, 0, 3, 0, 1, 0, 2, 2};
+
+//      int[] map1={1,1,1,21,21};
+//      int[] map1={14,11,1,10,11,14,21,10,3,16,21,21,16,2,14,11,7,16};
+//      int[] map1={1,2,3,3,3,13,3,4,5};
+//      int[] map1={1,2,3,3,3,13};
+
+//      int[] map1={15,15,21,21,21};
+//      int[] map1={6,6,6,8,9,10};
+//      int[] map1={9,9,9,9,6,6,11,12,13,18,19,20,21,21,21,21};
+
+//      int[] map1 = { 1, 2, 3, 4, 11, 12, 13, 14, 14 ,21,21,21};
+//      int[] map1 = { 1, 2, 3, 4, 1, 4, 11, 12, 13, 14, 11, 14 };
+
+//      int[] map1 = { 7, 5, 17, 14, 20, 1, 21, 3, 20, 21, 3, 15, 19, 1, 18, 5, 12, 6, 21, 21, 16 };
+
+        int[] map1 = { 1, 1, 2, 2, 3, 3, 11, 11, 12, 12, 13, 13, 21, 21, 21, 21 };
+
+        int[] map = new int[MAX_PAI_CNT];
+        for (int i = 0; i < map1.length; i++) {
+            map[map1[i]]++;
+        }
+
+//      int[] map = { 0, 0, 0, 1, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2 };
+
+        CanHu hu = new CanHu(map, 0, true);
+        long t = System.currentTimeMillis();
+
+        hu.takeOffAll();
+
+        System.out.println("|耗时->" + (System.currentTimeMillis() - t) + "|结果->" + hu.duiList.size());
+//      System.out.println(hu.duiList);
+
+        hu.duiList.stream().map(dui -> {
+
+            ArrayList<List<Integer>> duilist = new ArrayList<List<Integer>>();
+            while (dui > 0) {
+                duilist.add(popDui(dui));
+                dui >>>= (bitPai + bitType);
+            }
+            return duilist;
+        }).forEach(System.out::println);
+
+        hu.laiZiList.forEach(laizi -> {
+            while (laizi > 0) {
+                System.out.print((laizi & bytePai) + "|");
+                laizi >>>= bitPai;
+            }
+            System.out.println();
+        });
+
+    }
+
+}
+
+作者：9831ed449fe8
+链接：https://www.jianshu.com/p/88df77e21d6f
+来源：简书
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。
