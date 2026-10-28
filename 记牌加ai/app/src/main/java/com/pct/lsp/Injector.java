@@ -78,7 +78,21 @@ public final class Injector {
                             }, 1500);
                         }
                     });
-            log("已挂 Application.attach（仅用于悬浮窗）");
+            // ★ Android 11+ 上 LSPatch 加载模块的时机可能晚于 Application.attach，
+            //   那次调用已经过去，钩子装上也不会触发（真机实测：无 ui 日志）。
+            //   所以再挂 onCreate —— 它一定在模块加载后才会被调用。
+            XposedHelpers.findAndHookMethod("android.app.Application", loader, "onCreate",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            final Context c = (Context) param.thisObject;
+                            if (c == null || sCtx == null) sCtx = c;
+                            new Handler(Looper.getMainLooper()).postDelayed(new Runnable() {
+                                @Override public void run() { Overlay.show(c); }
+                            }, 1200);
+                        }
+                    });
+            log("已挂 Application.attach + onCreate（悬浮窗）");
         } catch (Throwable t) {
             log("挂 attach 失败（悬浮窗不可用）: " + t);
         }
@@ -164,5 +178,15 @@ public final class Injector {
 
     private static void log(String s) {
         XposedBridge.log(TAG + s);
+        // ★ 真机没 logcat 时靠这个文件定位（用户装上后把 /sdcard/pct/init.log 发回来）
+        try {
+            java.io.File dir = new java.io.File("/sdcard/pct");
+            if (!dir.exists()) dir.mkdirs();
+            java.io.FileWriter w = new java.io.FileWriter(
+                    new java.io.File(dir, "init.log"), true);
+            w.write(new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date())
+                    + " " + s + "\n");
+            w.close();
+        } catch (Throwable ignored) {}
     }
 }

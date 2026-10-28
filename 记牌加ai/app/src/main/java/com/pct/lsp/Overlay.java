@@ -75,6 +75,23 @@ public final class Overlay {
     public static void show(final Context ctx) {
         if (sRoot != null) return;
         sCtx = ctx;
+        // ★ 别人的机器没有 `appops set` —— 必须自己申请悬浮窗权限，
+        //   否则 addView 抛异常、面板永远不出现（用户实测「装上没有记牌器」）。
+        if (Build.VERSION.SDK_INT >= 23 && !android.provider.Settings.canDrawOverlays(ctx)) {
+            try {
+                android.content.Intent i = new android.content.Intent(
+                        android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        android.net.Uri.parse("package:" + ctx.getPackageName()));
+                i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(i);
+                android.widget.Toast.makeText(ctx,
+                        "请允许「显示在其他应用上层」，然后重开游戏",
+                        android.widget.Toast.LENGTH_LONG).show();
+            } catch (Throwable t) {
+                log("申请悬浮窗权限失败: " + t);
+            }
+            return;                       // 没权限就别硬 addView，会崩
+        }
         try {
             float dens = ctx.getResources().getDisplayMetrics().density;
             SCREEN_W = ctx.getResources().getDisplayMetrics().widthPixels;
@@ -177,9 +194,11 @@ public final class Overlay {
 
             sHandler = new Handler(Looper.getMainLooper());
             sHandler.post(refresh);
-            log("悬浮窗已添加（fagent 照搬版）");
+            log("悬浮窗已添加 type=" + sLp.type + " x=" + sLp.x + " y=" + sLp.y
+                    + " w=" + sLp.width + " 屏幕=" + SCREEN_W);
+            try { android.widget.Toast.makeText(ctx, "记牌器已启动", android.widget.Toast.LENGTH_SHORT).show(); } catch (Throwable ignored) {}
         } catch (Throwable t) {
-            log("悬浮窗失败: " + t);
+            logErr("悬浮窗失败", t);
         }
     }
 
@@ -650,15 +669,40 @@ public final class Overlay {
         if (b != null) iv.setImageBitmap(b);
     }
 
+    private static final java.util.HashMap<Integer, Bitmap> sCardCache = new java.util.HashMap<>();
+
+    /**
+     * 牌面：先读 /data/local/tmp/pct_cards/（开发机有 root 时用），
+     * 读不到就用**打进 dex 的 base64 素材** —— 真机没 root，/data/local/tmp 不可读，
+     * 只靠外部文件的话牌面全是空白（用户实测）。
+     */
     private static Bitmap loadBmp(int v) {
         try {
             int idx = v > 100 ? (v - 100 + 10) : v;      // fagent.js 322-324
+            Bitmap cached = sCardCache.get(idx);
+            if (cached != null) return cached;
             String s = "00" + idx;
             String path = CARD_DIR + "Card_" + s.substring(s.length() - 3) + ".png";
             Bitmap b = BitmapFactory.decodeFile(path);
+            if (b == null) b = fromDex(idx);
             if (b == null) return null;
             int px = dp(sCtx, CARD_DP);
-            return Bitmap.createScaledBitmap(b, px, px, true);
+            b = Bitmap.createScaledBitmap(b, px, px, true);
+            sCardCache.put(idx, b);
+            return b;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 内置牌面（Cards.B64）解码 + 缓存。 */
+    private static Bitmap fromDex(int idx) {
+        try {
+            if (idx < 0 || idx >= Cards.B64.length) return null;
+            String b64 = Cards.B64[idx];
+            if (b64 == null || b64.length() == 0) return null;
+            byte[] raw = android.util.Base64.decode(b64, android.util.Base64.DEFAULT);
+            return BitmapFactory.decodeByteArray(raw, 0, raw.length);
         } catch (Throwable t) {
             return null;
         }
@@ -742,5 +786,23 @@ public final class Overlay {
 
     private static void log(String s) {
         de.robv.android.xposed.XposedBridge.log(TAG + s);
+        try {
+            java.io.File dir = new java.io.File("/sdcard/pct");
+            if (!dir.exists()) dir.mkdirs();
+            java.io.FileWriter w = new java.io.FileWriter(
+                    new java.io.File(dir, "init.log"), true);
+            w.write(new java.text.SimpleDateFormat("HH:mm:ss").format(new java.util.Date())
+                    + " [ui] " + s + "\n");
+            w.close();
+        } catch (Throwable ignored) {}
+    }
+
+    /** 把异常连堆栈一起写日志 —— 真机上这是唯一的线索。 */
+    private static void logErr(String stage, Throwable t) {
+        StringBuilder sb = new StringBuilder(stage).append(": ").append(t);
+        for (StackTraceElement e : t.getStackTrace()) {
+            sb.append("\n    at ").append(e);
+        }
+        log(sb.toString());
     }
 }

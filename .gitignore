@@ -9,3 +9,6 @@ data/
 素材/
 data/
 *.jks
+
+# 分发包产物（单文件 >100MB，GitHub 拒收）
+记牌加ai/release/
