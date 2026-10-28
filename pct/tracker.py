@@ -143,6 +143,19 @@ class Tracker:
         self.bottom_ev: Optional[int] = None     # 开局 newCard 的 lastPut（最准）
         self._opened = False                     # 本局是否已见过第一条 newCard
 
+        # ---- 读牌信号：对手「摸牌→出牌」的思考时长 --------------------------
+        # 数据来源：newCard 每摸一张都会发（走 netCallBack，带 Date.now() 时间戳），
+        # 所以「摸到牌的那一刻」是可观测的；下一次 MJPut 到达时两者相减，
+        # 就是对手从拿到牌到点出牌的纯思考时间。
+        # 注意：_on_event 每轮会全量重放最近 240 条事件，必须用事件序号 q 去重，
+        # 不能直接累加，否则同一次出牌会被算很多遍。
+        self._think_seq = 0                      # 已处理到的事件序号
+        self._think_key = (0, 0)                 # 去重游标 (时间戳, 序号)
+        self._draw_t = 0                         # 最近一次摸牌的时刻（ms）
+        self._last_put_t = 0                     # 上一张牌打出的时刻（gap 兜底用）
+        self._gap: List[int] = []                # 「上一张牌→对手出牌」间隔样本
+        self._think: Dict[str, List[int]] = {"opp": []}   # 思考时长样本（ms）
+
     # ------------------------------------------------------------------ 身份
     def _identify(self, live: Dict[str, Any]) -> None:
         me = live.get("me")
@@ -155,6 +168,11 @@ class Tracker:
             self.my_seat = uids.index(self.me)
             for i, u in enumerate(uids):
                 if u != self.me:
+                    if self.opp is not None and self.opp != u:
+                        # 换对手了：旧的思考时长样本属于上一个人，留着会污染判断
+                        self._think["opp"].clear()
+                        self._gap.clear()
+                        self._last_put_t = 0
                     self.opp = u
                     self.opp_seat = i
                     break
@@ -305,11 +323,66 @@ class Tracker:
         self.dealt = []
         self._opp_all_puts = []
 
+    def _track_think(self, e: Dict[str, Any], name: str) -> None:
+        """记录对手「摸牌→出牌」的间隔，作为读牌信号。
+
+        newCard 每摸一张都会发（走 netCallBack，带 Date.now() 时间戳），
+        所以「摸到牌的那一刻」是可观测的；下一次对手 MJPut 到达时相减，
+        就是他从拿到牌到点出牌的纯思考时长（不含网络往返的猜测成分）。
+
+        ★ 必须去重：_on_event 每轮会把最近 240 条事件全量重放。用 (t, q) 组合做游标——
+          重放时这两个值不会超过已处理的最大值；队列清空重开时 t 继续往前走，
+          游标自然越过，两种情形都能正确处理（只看 q 会被「重放＝序号倒退」骗到）。
+        """
+        try:
+            seq = int(e.get("q") or 0)
+            t = int(e.get("t") or 0)
+        except (TypeError, ValueError):
+            return
+        if not seq or not t:
+            return
+        key = (t, seq)
+        if key <= self._think_key:
+            return
+        self._think_key = key
+
+        if name == "newCard":
+            self._draw_t = t
+            return
+        if name != "MJPut" or self.opp is None:
+            return
+        try:
+            uid = int((e.get("d") or {}).get("uid") or 0)
+        except (TypeError, ValueError):
+            return
+        # —— 兜底信号：上一张牌到对手这张牌的间隔（含摸牌，总是可用）——
+        gap = t - self._last_put_t if self._last_put_t else 0
+        self._last_put_t = t
+        if uid == self.opp and 200 <= gap <= 60000:
+            self._gap.append(gap)
+            if len(self._gap) > 12:
+                self._gap.pop(0)
+        if uid != self.opp:
+            # 自己出牌：之前那次摸牌作废，否则对手随后碰/吃直接出牌会被误算
+            self._draw_t = 0
+            return
+        if not self._draw_t:
+            return
+        dt = t - self._draw_t
+        self._draw_t = 0                 # 一次摸牌只对应一次出牌
+        # 200ms 以下多是 UI 动画或事件重发；60s 以上是挂机/掉线，都不算思考
+        if 200 <= dt <= 60000:
+            samples = self._think["opp"]
+            samples.append(dt)
+            if len(samples) > 12:
+                samples.pop(0)
+
     def _on_event(self, e: Dict[str, Any], quota: Optional[Counter] = None,
                   opp_snapshot: Optional[Dict[str, Any]] = None) -> None:
         """处理一条事件。出牌要消耗 quota 里的一份额度，用完的不记（重发）。"""
         name = e.get("e")
         d = e.get("d") or {}
+        self._track_think(e, name)
 
         # ★ mjhand：发牌事件。d.mjhand 是**未排序的发牌顺序**（sData 里那份是
         #   排过序的，所以之前从 sData 取 hand[20] 永远取不到底牌）。
@@ -787,7 +860,33 @@ class Tracker:
                                 if isinstance(self._visible_actions, list)
                                 and self._visible_actions else None),
             "analysis": self._hand_analysis(),
+            "oppThink": self._think_summary(),
             "roomRules": self._room_rules_explained(),
+        }
+
+    def _think_summary(self) -> Optional[Dict[str, Any]]:
+        """对手出牌前的耗时（秒）。
+
+        两个来源，优先精确的：
+        - src="draw"：从「对手摸到牌」算到「他出牌」，纯思考时间
+        - src="gap" ：从「上一张牌」算起，含摸牌过程，只在 draw 样本不足时兜底
+
+        样本少于 2 次返回 None —— 单个样本分不出「他平时就快」还是「这次碰巧快」，
+        给出去只会让模型过度解读。宁可没有，不可误导。
+        """
+        think = list(self._think.get("opp") or [])
+        if len(think) >= 2:
+            src, s = "draw", think
+        elif len(self._gap) >= 2:
+            src, s = "gap", list(self._gap)
+        else:
+            return None
+        return {
+            "src": src,
+            "last": round(s[-1] / 1000.0, 1),
+            "avg": round(sum(s) / len(s) / 1000.0, 1),
+            "recent": [round(x / 1000.0, 1) for x in s[-5:]],
+            "n": len(s),
         }
 
     def _room_rules_explained(self) -> Dict[str, Any]:
